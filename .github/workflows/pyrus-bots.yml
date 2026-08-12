@@ -1,0 +1,30 @@
+name: Pyrus bots
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-bots:
+    runs-on: ubuntu-latest
+    env:
+      PYRUS_LOGIN: ${{ secrets.PYRUS_LOGIN }}
+      PYRUS_SECURITY_KEY: ${{ secrets.PYRUS_SECURITY_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Остаток по смете (все активные заявки)
+        run: python budget_remainder_bot.py
+
+      - name: Напоминания о просрочке поставки
+        run: python overdue_reminder_bot.py
+
+      - name: Сверка УПД со счётом
+        run: python upd_reconciliation_bot.py
