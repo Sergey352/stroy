@@ -37,11 +37,28 @@
  * даже после того как Строй_Прораб согласовал свою часть). Если бота
  * когда-нибудь добавят на другой, реально решающий шаг маршрута — эту
  * безусловную автоаппрувалку нужно будет пересмотреть.
+ *
+ * ВАЖНО #2 (тоже найдено на практике): вебхук у бота-участника шага
+ * срабатывает только когда для бота есть НОВОЕ ожидающее действие — то
+ * есть при создании задачи и (пока бот ещё не ответил) при новых
+ * комментариях. Как только бот один раз ответил approved, повторные
+ * правки полей той же задачи (даже с текстовым комментарием) вебхук НЕ
+ * переиспускают — проверено на реальной задаче. Поэтому правки полей
+ * ПОСЛЕ первого сохранения заявки ловит не вебхук, а cron ниже
+ * (scheduled-обработчик, Cloudflare Cron Trigger) — обходит все активные
+ * заявки и обновляет только то, что реально изменилось. Настраивается в
+ * Cloudflare dashboard: Worker → Settings → Triggers → Cron Triggers
+ * (не читается автоматически из wrangler.toml при деплое вставкой кода
+ * через Edit code — добавить триггер нужно там же, вручную).
  */
 
 const FORM_ID = 2455896;
 
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sweepAllTasks(env));
+  },
+
   async fetch(request, env) {
     if (request.method !== "POST") {
       return new Response("method not allowed", { status: 405 });
@@ -135,6 +152,16 @@ async function pyrusGet(apiUrl, token, path, params) {
   return resp.json();
 }
 
+async function pyrusPost(apiUrl, token, path, payload) {
+  const resp = await fetch(`${apiUrl}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) throw new Error(`POST ${path} failed: ${resp.status}`);
+  return resp.json();
+}
+
 function fieldByCode(fields, code) {
   for (const f of fields || []) {
     if (f.code === code || (f.info && f.info.code === code)) return f;
@@ -204,4 +231,64 @@ async function computeBudgetRemainderUpdate(taskId, env) {
   const remainder = limit - used - quantity;
 
   return [{ code: "budget_remainder", value: remainder }];
+}
+
+async function getLimitsMap(apiUrl, token) {
+  const catalogsResp = await pyrusGet(apiUrl, token, "catalogs");
+  const catalog = (catalogsResp.catalogs || []).find(
+    (c) => c.name === "Лимиты по объектам" && !c.deleted
+  );
+  const map = new Map();
+  if (!catalog) return map;
+  const catalogData = await pyrusGet(apiUrl, token, `catalogs/${catalog.catalog_id}`);
+  for (const item of catalogData.items || []) {
+    const values = item.values;
+    if (values && values.length >= 5) {
+      map.set(`${values[4]}|${values[1]}`, parseFloat(values[2]));
+    }
+  }
+  return map;
+}
+
+// Вызывается по Cloudflare Cron Trigger (см. scheduled() выше) — ловит
+// правки полей УЖЕ созданных заявок, которые вебхук не видит (см. докстринг
+// вверху файла, "ВАЖНО #2"). Обновляет задачу только если значение реально
+// изменилось — иначе на каждый минутный тик шёл бы шум по всем заявкам.
+async function sweepAllTasks(env) {
+  const { token, apiUrl } = await pyrusAuth(env);
+  const limits = await getLimitsMap(apiUrl, token);
+  const register = await pyrusGet(apiUrl, token, `forms/${FORM_ID}/register`, { include_archived: "n" });
+
+  const parsedByTask = new Map();
+  const currentRemainderByTask = new Map();
+  for (const task of register.tasks || []) {
+    const parsed = objCatQty(task.fields || []);
+    if (parsed) parsedByTask.set(task.id, parsed);
+    const remField = fieldByCode(task.fields || [], "budget_remainder");
+    currentRemainderByTask.set(task.id, remField ? remField.value : null);
+  }
+
+  for (const [taskId, [objectName, categoryName, quantity]] of parsedByTask) {
+    const limit = limits.get(`${objectName}|${categoryName}`);
+    if (limit === undefined) continue;
+
+    let usedByOthers = 0;
+    for (const [tid, [o, c, q]] of parsedByTask) {
+      if (tid !== taskId && o === objectName && c === categoryName) usedByOthers += q;
+    }
+    const remainder = limit - usedByOthers - quantity;
+
+    const currentValue = currentRemainderByTask.get(taskId);
+    if (currentValue !== null && currentValue !== undefined && Math.abs(Number(currentValue) - remainder) < 0.01) {
+      continue; // не изменилось — задачу не трогаем
+    }
+
+    try {
+      await pyrusPost(apiUrl, token, `tasks/${taskId}/comments`, {
+        field_updates: [{ code: "budget_remainder", value: remainder }],
+      });
+    } catch (e) {
+      console.error(`sweep update failed for task ${taskId}:`, e);
+    }
+  }
 }

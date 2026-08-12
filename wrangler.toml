@@ -2,6 +2,14 @@ name = "pyrus-budget-webhook"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# Ловит правки полей уже созданных заявок (вебхук их не видит — см.
+# докстринг "ВАЖНО #2" в src/index.js). При деплое через Edit code
+# (вставка кода в дашборде, не через wrangler/Git) эта секция НЕ
+# применяется — триггер нужно добавить вручную: Worker → Settings →
+# Triggers → Cron Triggers → Add Cron Trigger → "* * * * *".
+[triggers]
+crons = ["* * * * *"]
+
 # Секреты (PYRUS_LOGIN, PYRUS_SECURITY_KEY, PYRUS_WEBHOOK_SECRET) задаются
 # в Cloudflare dashboard (Workers & Pages → этот воркер → Settings →
 # Variables and Secrets, тип "Secret") или через `wrangler secret put <NAME>`
