@@ -27,6 +27,16 @@
  *
  * Файл специально самодостаточный (логика расчёта продублирована из
  * budget_remainder_bot.py) — при изменении формулы остатка правьте оба места.
+ *
+ * ВАЖНО (найдено на практике, не только в теории): бот добавлен в маршрут
+ * как участник шага 1 «Заполнение заявки» в ОДНОЙ группе согласования с
+ * ролью Строй_Прораб — а группа требует approval_choice от ВСЕХ участников
+ * (не "любой из"), иначе задача не продвигается на шаг 2. Поэтому ответ
+ * вебхука ВСЕГДА должен содержать approval_choice: "approved" — иначе бот
+ * молча вешает согласование навечно (проверено: задача застряла на шаге 1
+ * даже после того как Строй_Прораб согласовал свою часть). Если бота
+ * когда-нибудь добавят на другой, реально решающий шаг маршрута — эту
+ * безусловную автоаппрувалку нужно будет пересмотреть.
  */
 
 const FORM_ID = 2455896;
@@ -48,26 +58,35 @@ export default {
     try {
       payload = JSON.parse(rawBody);
     } catch (e) {
-      return new Response("", { status: 200 });
+      return approveResponse();
     }
 
     const taskId = payload.task_id || (payload.task && payload.task.id);
     if (!taskId) {
-      return new Response("", { status: 200 });
+      return approveResponse();
     }
 
+    let fieldUpdates = null;
     try {
-      await recalcBudgetRemainder(taskId, env);
+      fieldUpdates = await computeBudgetRemainderUpdate(taskId, env);
     } catch (e) {
-      // Намеренно не роняем вебхук ошибкой — если бот добавлен обязательным
-      // участником шага, 4xx/5xx-ответ мог бы застопорить реальную заявку
-      // из-за сбоя в нашем расчёте. Ошибку просто логируем.
+      // Намеренно не роняем вебхук ошибкой и всё равно согласовываем —
+      // бот не должен стопорить реальную заявку из-за сбоя в нашем расчёте.
       console.error(`budget remainder webhook error for task ${taskId}:`, e);
     }
 
-    return new Response("", { status: 200 });
+    return approveResponse(fieldUpdates);
   },
 };
+
+function approveResponse(fieldUpdates) {
+  const body = { approval_choice: "approved" };
+  if (fieldUpdates) body.field_updates = fieldUpdates;
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 async function isSignatureValid(rawBody, secret, signatureHex) {
   if (!secret || !signatureHex) return false;
@@ -113,16 +132,6 @@ async function pyrusGet(apiUrl, token, path, params) {
   }
   const resp = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
   if (!resp.ok) throw new Error(`GET ${path} failed: ${resp.status}`);
-  return resp.json();
-}
-
-async function pyrusPost(apiUrl, token, path, payload) {
-  const resp = await fetch(`${apiUrl}${path}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!resp.ok) throw new Error(`POST ${path} failed: ${resp.status}`);
   return resp.json();
 }
 
@@ -179,22 +188,20 @@ async function sumUsedBudget(apiUrl, token, objectName, categoryName, excludeTas
   return total;
 }
 
-async function recalcBudgetRemainder(taskId, env) {
+async function computeBudgetRemainderUpdate(taskId, env) {
   const { token, apiUrl } = await pyrusAuth(env);
   const taskResp = await pyrusGet(apiUrl, token, `tasks/${taskId}`);
   const fields = taskResp.task.fields || [];
 
   const parsed = objCatQty(fields);
-  if (!parsed) return; // заявка ещё не заполнена настолько, чтобы считать остаток
+  if (!parsed) return null; // заявка ещё не заполнена настолько, чтобы считать остаток
   const [objectName, categoryName, quantity] = parsed;
 
   const limit = await getLimit(apiUrl, token, objectName, categoryName);
-  if (limit === null) return;
+  if (limit === null) return null;
 
   const used = await sumUsedBudget(apiUrl, token, objectName, categoryName, taskId);
   const remainder = limit - used - quantity;
 
-  await pyrusPost(apiUrl, token, `tasks/${taskId}/comments`, {
-    field_updates: [{ code: "budget_remainder", value: remainder }],
-  });
+  return [{ code: "budget_remainder", value: remainder }];
 }
