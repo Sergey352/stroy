@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .env
 .claude/
+.wrangler/
+node_modules/
