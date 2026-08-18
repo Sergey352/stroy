@@ -50,14 +50,16 @@
     python3 smeta_remainder_bot.py --dry-run   # только показать, что изменится
 
 ВТОРАЯ ЗАДАЧА ЭТОГО БОТА — «позиции нет в справочнике» (см. функцию
-check_missing_items ниже): т.к. catalog-поле в Pyrus не поддерживает
+get_missing_descriptions ниже): т.к. catalog-поле в Pyrus не поддерживает
 свободный ввод (только строгий выбор из существующих элементов, проверено
-по официальной документации в сессии 2026-08-18), у таблицы «Позиции
-заявки» должна быть ЕЩЁ ОДНА колонка — текстовая, код `item_missing_description`
-(«Если позиции нет в списке — опишите здесь») — пользователь заполняет её
-вместо (не вместе с) «Номенклатура», когда не нашёл нужный материал в
-справочнике. Бот такие строки не может посчитать (не знает item_id) —
-вместо этого оставляет заявителю/снабженцу комментарий-напоминание.
+по официальной документации в сессии 2026-08-18), пользователь завёл в
+конструкторе ОТДЕЛЬНУЮ таблицу «Позиции, отсутствующие в смете»
+(code=missing_items_table, поля not_item_name/not_item_unit/
+not_item_qty_ordered/not_item_price) — заполняется вместо строки в
+основной таблице «Позиции заявки», когда нужного материала нет в
+справочнике «Смета». Бот такие строки посчитать не может (нет item_id) —
+вместо этого оставляет заявителю/снабженцу комментарий-напоминание со
+списком, чтобы снабженец добавил позиции в справочник вручную.
 
 Запуск (тот же скрипт, оба действия — пересчёт остатка и проверка
 недостающих позиций — выполняются вместе за один проход по задачам):
@@ -133,28 +135,36 @@ def get_ordered_quantities(task):
 
 
 def get_missing_descriptions(task):
-    """Возвращает список текстов из колонки item_missing_description —
-    по одной строке таблицы на каждую позицию, которую не нашли в
-    справочнике «Смета». Строка считается «недостающей», только если
-    Номенклатура ПУСТА (а не просто одновременно с описанием — если
-    Номенклатура выбрана, текст в этой колонке уже не актуален, даже
-    если пользователь забыл его стереть)."""
+    """Возвращает список описаний недостающих позиций из отдельной
+    таблицы «Позиции, отсутствующие в смете» (code=missing_items_table,
+    добавлена пользователем в конструкторе в сессии 2026-08-18 — своя
+    таблица, а не колонка внутри «Позиции заявки», как предполагалось
+    изначально: у неё сразу 4 поля — Название/Ед.изм./Заказанное
+    количество/Цена, снабженцу этого достаточно, чтобы завести новую
+    позицию в справочнике «Смета» без дополнительных вопросов автору
+    заявки). Пустые строки (ничего не заполнено) пропускаются."""
     descriptions = []
-    table_field = field_by_code(task.get("fields", []), "items_table")
+    table_field = field_by_code(task.get("fields", []), "missing_items_table")
     if not table_field:
         return descriptions
 
     for row in table_field.get("value") or []:
         cells = row.get("cells", [])
-        catalog_cell = field_by_code(cells, "item_catalog")
-        missing_cell = field_by_code(cells, "item_missing_description")
-        if not missing_cell:
-            continue  # колонка ещё не добавлена в форму — тихо пропускаем
+        name = (field_by_code(cells, "not_item_name") or {}).get("value")
+        unit = (field_by_code(cells, "not_item_unit") or {}).get("value")
+        qty = (field_by_code(cells, "not_item_qty_ordered") or {}).get("value")
+        price = (field_by_code(cells, "not_item_price") or {}).get("value")
 
-        has_catalog_value = bool((catalog_cell.get("value") or {}).get("item_id")) if catalog_cell else False
-        missing_text = (missing_cell.get("value") or "").strip()
-        if not has_catalog_value and missing_text:
-            descriptions.append(missing_text)
+        name = (name or "").strip()
+        if not name:
+            continue  # пустая строка (черновик) — пропускаем
+
+        parts = [name]
+        if qty is not None:
+            parts.append(f"{qty} {unit or ''}".strip())
+        if price is not None:
+            parts.append(f"цена {price}")
+        descriptions.append(", ".join(parts))
 
     return descriptions
 
@@ -183,10 +193,11 @@ def notify_missing_items(client, task):
     lines = "\n".join(f"- {d}" for d in descriptions)
     text = (
         f"{MISSING_ITEM_MARKER}\n"
-        f"В заявке есть позиции, которых нет в справочнике «Смета»:\n{lines}\n\n"
+        f"В таблице «Позиции, отсутствующие в смете» указаны позиции, которых "
+        f"нет в справочнике «Смета»:\n{lines}\n\n"
         f"Снабженцу нужно добавить их в справочник (вручную в Pyrus или через "
-        f"smeta_catalog_import.py), после чего заявитель сможет выбрать позицию "
-        f"в поле «Номенклатура» этой строки."
+        f"smeta_catalog_import.py) — после этого их можно будет выбрать в поле "
+        f"«Номенклатура» основной таблицы «Позиции заявки»."
     )
     client.post(f"tasks/{task['id']}/comments", {"text": text})
     return True
