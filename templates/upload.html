@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<!--
+  Страница загрузки сметы — для снабженца/сметчика, не для программиста.
+  Отдаётся Flask-роутом /upload из webhook_server.py. Никакого JS-фреймворка
+  и внешних библиотек — обычная HTML-форма (метод POST, multipart/form-data
+  для файла), чтобы работало в любом браузере без сборки и зависимостей.
+-->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Загрузка сметы — Pyrus</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 16px;
+      color: #1a1a1a;
+      background: #fafafa;
+    }
+    h1 { font-size: 22px; }
+    .drop-zone {
+      border: 2px dashed #999;
+      border-radius: 8px;
+      padding: 32px;
+      text-align: center;
+      background: #fff;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .drop-zone.dragover {
+      border-color: #2b6cb0;
+      background: #ebf4ff;
+    }
+    .drop-zone input[type="file"] { display: none; }
+    #file-name { margin-top: 10px; font-weight: 600; color: #2b6cb0; }
+    .buttons { margin-top: 16px; display: flex; gap: 12px; }
+    button {
+      flex: 1;
+      padding: 12px;
+      font-size: 15px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button[value="dry_run"] { background: #e2e8f0; color: #1a1a1a; }
+    button[value="import"] { background: #2b6cb0; color: #fff; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .error {
+      margin-top: 20px;
+      padding: 14px;
+      background: #fff5f5;
+      border: 1px solid #feb2b2;
+      border-radius: 6px;
+      color: #9b2c2c;
+    }
+    .result {
+      margin-top: 20px;
+      padding: 16px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    .result h2 { margin-top: 0; font-size: 17px; }
+    .result table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+    .result td { padding: 4px 0; }
+    .result td:first-child { color: #555; width: 60%; }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .badge.dry { background: #fefcbf; color: #744210; }
+    .badge.done { background: #c6f6d5; color: #22543d; }
+    .warn-list { color: #9b6d00; font-size: 14px; }
+    .warn-list li { margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Загрузка сметы объекта в Pyrus</h1>
+  <p>Выберите Excel-файл сметы (.xlsx). Объект определяется автоматически по названию в файле.</p>
+
+  <form method="POST" enctype="multipart/form-data" id="upload-form">
+    <div class="drop-zone" id="drop-zone">
+      <div>Перетащите файл сюда или нажмите, чтобы выбрать</div>
+      <div id="file-name"></div>
+      <input type="file" name="smeta_file" id="file-input" accept=".xlsx" required>
+    </div>
+    <div class="buttons">
+      <button type="submit" name="mode" value="dry_run">Проверить (без сохранения)</button>
+      <button type="submit" name="mode" value="import">Загрузить в Pyrus</button>
+    </div>
+  </form>
+
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+
+  {% if result %}
+  <div class="result">
+    <h2>
+      Файл {{ filename }}
+      {% if result.dry_run %}
+        <span class="badge dry">проверка, ничего не сохранено</span>
+      {% else %}
+        <span class="badge done">загружено в Pyrus</span>
+      {% endif %}
+    </h2>
+    <table>
+      <tr><td>Позиций в файле</td><td>{{ result.raw_count }}</td></tr>
+      <tr><td>После объединения одинаковых (имя + категория)</td><td>{{ result.aggregated_count }}</td></tr>
+      <tr><td>Объект(ы) в файле</td><td>{{ result.objects | join(", ") }}</td></tr>
+      {% if result.added_objects %}
+      <tr><td>Новые объекты, добавленные в справочник «Объекты стройки»</td><td>{{ result.added_objects | join(", ") }}</td></tr>
+      {% endif %}
+      <tr><td>Новых позиций</td><td>{{ result.new_count }}</td></tr>
+      <tr><td>Обновлено существующих позиций</td><td>{{ result.updated_count }}</td></tr>
+      {% if not result.dry_run %}
+      <tr><td>Реально добавлено/обновлено в справочнике «Смета»</td><td>{{ result.added }} / {{ result.updated }}</td></tr>
+      {% endif %}
+    </table>
+
+    {% if result.truncated_names %}
+    <p><b>Внимание:</b> {{ result.truncated_names | length }} наименований обрезано (слишком длинные для одной строки справочника):</p>
+    <ul class="warn-list">
+      {% for name in result.truncated_names %}<li>{{ name }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if result.stale %}
+    <p><b>Внимание:</b> {{ result.stale | length }} позиций этого же объекта, которые раньше были в справочнике, отсутствуют в новом файле (автоматически не удалены — проверьте вручную, если это не ошибка в файле):</p>
+    <ul class="warn-list">
+      {% for row in result.stale[:20] %}<li>{{ row.get("Наименование") }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if result.dry_run %}
+    <p>Если всё верно — загрузите этот же файл ещё раз кнопкой «Загрузить в Pyrus».</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <script>
+    // Только косметика (подсветка зоны при перетаскивании файла и показ
+    // имени выбранного файла) — сама отправка формы работает и без JS,
+    // обычным нажатием на область (клик открывает системный выбор файла
+    // благодаря <label>-подобному поведению клика по .drop-zone).
+    const dropZone = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    const fileNameEl = document.getElementById('file-name');
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    function showFileName() {
+      fileNameEl.textContent = fileInput.files.length ? fileInput.files[0].name : '';
+    }
+    fileInput.addEventListener('change', showFileName);
+
+    ['dragenter', 'dragover'].forEach(evt =>
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+      })
+    );
+    ['dragleave', 'drop'].forEach(evt =>
+      dropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+      })
+    );
+    dropZone.addEventListener('drop', (e) => {
+      if (e.dataTransfer.files.length) {
+        fileInput.files = e.dataTransfer.files;
+        showFileName();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -128,24 +128,27 @@ def ensure_objects_registered(client, object_names):
     справочник. Колонка «Адрес» у автодобавленных объектов остаётся
     пустой (в файле сметы адреса нет — см. CLAUDE.md) — снабженец может
     дозаполнить вручную в самом справочнике Pyrus при необходимости, на
-    работу формы пустой адрес не влияет."""
+    работу формы пустой адрес не влияет.
+
+    Возвращает список реально добавленных названий (пустой, если добавлять
+    было нечего) — вызывающий код сам решает, печатать это в консоль или
+    показать на веб-странице."""
     catalog_id = client.find_catalog_id(OBJECTS_CATALOG_NAME)
     if not catalog_id:
-        print(f"  Справочник «{OBJECTS_CATALOG_NAME}» не найден — новые объекты не добавлены")
-        return
+        return []
 
     catalog = client.get(f"catalogs/{catalog_id}")
     existing_names = {item["values"][0] for item in catalog.get("items", []) if item.get("values")}
 
     to_add = [name for name in object_names if name and name not in existing_names]
     if not to_add:
-        return
+        return []
 
     client.post(
         f"catalogs/{catalog_id}/diff",
         {"upsert": [{"values": [name, ""]} for name in to_add]},
     )
-    print(f"  Добавлены новые объекты в «{OBJECTS_CATALOG_NAME}»: {to_add}")
+    return to_add
 
 
 def load_existing_rows(client, catalog_id):
@@ -163,22 +166,23 @@ def load_existing_rows(client, catalog_id):
     return existing
 
 
-def import_file(path, dry_run=False):
-    print(f"Разбираю файл: {path}")
+def run_import(path, dry_run=False):
+    """Вся логика загрузки одного файла — без единого print(), только
+    возвращает словарь с результатом. Так эту функцию может использовать
+    и командная строка (import_file() ниже печатает по этому словарю), и
+    веб-страница загрузки (upload_server.py показывает то же самое в
+    браузере) — расчёт один, вывод результата в двух местах разный."""
     raw_positions = parse_smeta_file(path)
     positions = aggregate_positions(raw_positions)
     objects = sorted(set(p["object"] for p in positions))
-    print(f"  сырых позиций: {len(raw_positions)}, после агрегации: {len(positions)}")
-    print(f"  объекты в файле: {objects}")
 
     client = PyrusClient()
 
+    added_objects = []
     if not dry_run:
-        ensure_objects_registered(client, objects)
+        added_objects = ensure_objects_registered(client, objects)
 
     catalog_id = client.find_or_create_catalog(CATALOG_NAME, CATALOG_HEADERS)
-    print(f"Справочник «{CATALOG_NAME}»: catalog_id={catalog_id}")
-
     existing = load_existing_rows(client, catalog_id)
 
     upsert_rows = []
@@ -220,24 +224,62 @@ def import_file(path, dry_run=False):
         if row.get("Объект") in objects and key not in new_keys_this_object
     ]
 
-    print(f"\nК загрузке: {len(upsert_rows)} строк (новых: {new_count}, обновляемых: {updated_count})")
-    if truncated_names:
-        print(f"  ВНИМАНИЕ: {len(truncated_names)} наименований обрезано (превышали лимит в 500 символов на строку):")
-        for n in truncated_names:
+    added = updated = 0
+    if not dry_run:
+        result = client.post(f"catalogs/{catalog_id}/diff", {"upsert": upsert_rows})
+        added = len(result.get("added", []))
+        updated = len(result.get("updated", []))
+
+    return {
+        "dry_run": dry_run,
+        "raw_count": len(raw_positions),
+        "aggregated_count": len(positions),
+        "objects": objects,
+        "added_objects": added_objects,
+        "catalog_id": catalog_id,
+        "new_count": new_count,
+        "updated_count": updated_count,
+        "truncated_names": truncated_names,
+        "stale": stale,
+        "added": added,
+        "updated": updated,
+    }
+
+
+def print_report(summary):
+    """Печатает результат run_import() в консоль — используется только
+    CLI-версией (import_file), веб-страница форматирует те же данные
+    сама в HTML."""
+    print(f"  сырых позиций: {summary['raw_count']}, после агрегации: {summary['aggregated_count']}")
+    print(f"  объекты в файле: {summary['objects']}")
+    if summary["added_objects"]:
+        print(f"  добавлены новые объекты в «{OBJECTS_CATALOG_NAME}»: {summary['added_objects']}")
+    print(f"Справочник «{CATALOG_NAME}»: catalog_id={summary['catalog_id']}")
+
+    total = summary["new_count"] + summary["updated_count"]
+    print(f"\nК загрузке: {total} строк (новых: {summary['new_count']}, обновляемых: {summary['updated_count']})")
+
+    if summary["truncated_names"]:
+        print(f"  ВНИМАНИЕ: {len(summary['truncated_names'])} наименований обрезано (превышали лимит в 500 символов на строку):")
+        for n in summary["truncated_names"]:
             print(f"    - {n[:80]}...")
-    if stale:
-        print(f"  ВНИМАНИЕ: {len(stale)} прежних позиций этих объектов отсутствуют в новом файле (не удалены автоматически):")
-        for row in stale[:20]:
+
+    if summary["stale"]:
+        print(f"  ВНИМАНИЕ: {len(summary['stale'])} прежних позиций этих объектов отсутствуют в новом файле (не удалены автоматически):")
+        for row in summary["stale"][:20]:
             print(f"    - [{row.get('Объект')}] {row.get('Наименование')}")
 
-    if dry_run:
+    if summary["dry_run"]:
         print("\n--dry-run: ничего не отправлено в Pyrus.")
-        return
+    else:
+        print(f"\nГотово. Добавлено строк: {summary['added']}, обновлено: {summary['updated']}")
 
-    result = client.post(f"catalogs/{catalog_id}/diff", {"upsert": upsert_rows})
-    added = len(result.get("added", []))
-    updated = len(result.get("updated", []))
-    print(f"\nГотово. Добавлено строк: {added}, обновлено: {updated}")
+
+def import_file(path, dry_run=False):
+    print(f"Разбираю файл: {path}")
+    summary = run_import(path, dry_run=dry_run)
+    print_report(summary)
+    return summary
 
 
 def main():

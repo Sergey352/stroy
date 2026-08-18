@@ -34,6 +34,17 @@ smeta_remainder_bot.py, и .py, и вебхук здесь его просто �
   smeta_remainder_bot.py по расписанию — на своём сервере это обычный
   цикл с sleep, Cloudflare Cron Trigger больше не нужен.
 
+СТРАНИЦА ЗАГРУЗКИ СМЕТЫ (/upload, добавлено в сессии 2026-08-18):
+  Тот же самый Flask-процесс (тот же контейнер, тот же порт) обслуживает
+  ещё и простую HTML-страницу для снабженца/сметчика — залить .xlsx со
+  сметой объекта, не открывая терминал. Логика разбора и загрузки та же,
+  что и в CLI-версии (smeta_catalog_import.py, функция run_import) —
+  никакого дублирования, страница просто вызывает ту же функцию и
+  показывает результат в браузере вместо консоли. Доступ к /upload
+  защищён Basic Auth на уровне Caddy (см. Caddyfile) — путь "/" (сам
+  вебхук для Pyrus) без пароля, потому что Pyrus не умеет посылать
+  Basic Auth, а подлинность запроса там и так проверяется подписью.
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (см. .env.example):
   PYRUS_LOGIN            — pyrus_demo@outlook.com
   PYRUS_SECURITY_KEY     — секретный ключ Pyrus API
@@ -49,15 +60,22 @@ import hashlib
 import hmac
 import logging
 import os
+import tempfile
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
 
+from smeta_catalog_import import run_import
 from smeta_remainder_bot import sweep
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("webhook")
 
 app = Flask(__name__)
+# Ограничение на размер загружаемого файла — 20 МБ с большим запасом
+# (реальная смета «Акварель ОВВК» — меньше 200 КБ); защита от случайной
+# заливки не-того файла или обрыва соединения посреди огромной загрузки.
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
 WEBHOOK_SECRET = os.environ.get("PYRUS_WEBHOOK_SECRET", "")
 
@@ -95,6 +113,46 @@ def pyrus_webhook():
         logger.exception("sweep() упал при обработке вебхука для задачи %s", task_id)
 
     return jsonify({"approval_choice": "approved"}), 200
+
+
+@app.route("/upload", methods=["GET"])
+def upload_form():
+    """Показывает пустую форму загрузки — без файла и без результата."""
+    return render_template("upload.html", result=None, error=None)
+
+
+@app.route("/upload", methods=["POST"])
+def upload_submit():
+    """Обрабатывает загруженный файл: сохраняет во временную папку (она
+    удаляется автоматически по выходу из `with`, файл не остаётся на
+    диске сервера), разбирает и загружает через run_import() —
+    ту же функцию, что использует и smeta_catalog_import.py из
+    командной строки.
+
+    Кнопок на странице две — «Проверить» и «Загрузить в Pyrus» — обе
+    отправляют один и тот же form, различаются только скрытым полем
+    `mode` (dry_run/import), которое выставляет нажатая кнопка (см.
+    templates/upload.html, атрибут value у <button>)."""
+    uploaded = request.files.get("smeta_file")
+    mode = request.form.get("mode", "dry_run")
+
+    if not uploaded or uploaded.filename == "":
+        return render_template("upload.html", result=None, error="Файл не выбран.")
+
+    filename = secure_filename(uploaded.filename)
+    if not filename.lower().endswith(".xlsx"):
+        return render_template("upload.html", result=None, error="Нужен файл в формате .xlsx.")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, filename)
+        uploaded.save(path)
+        try:
+            summary = run_import(path, dry_run=(mode == "dry_run"))
+        except Exception as e:
+            logger.exception("Ошибка обработки загруженной сметы %s", filename)
+            return render_template("upload.html", result=None, error=f"Ошибка при разборе файла: {e}")
+
+    return render_template("upload.html", result=summary, error=None, filename=filename)
 
 
 @app.route("/healthz", methods=["GET"])
