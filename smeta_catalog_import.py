@@ -118,6 +118,36 @@ def build_row_values(key, pos, remaining):
     return values, truncated
 
 
+OBJECTS_CATALOG_NAME = "Объекты стройки"
+
+
+def ensure_objects_registered(client, object_names):
+    """Добавляет в справочник «Объекты стройки» те объекты из загружаемой
+    сметы, которых там ещё нет — чтобы поле «Объект» формы сразу знало про
+    новый объект, не дожидаясь, пока кто-то вручную впишет его в
+    справочник. Колонка «Адрес» у автодобавленных объектов остаётся
+    пустой (в файле сметы адреса нет — см. CLAUDE.md) — снабженец может
+    дозаполнить вручную в самом справочнике Pyrus при необходимости, на
+    работу формы пустой адрес не влияет."""
+    catalog_id = client.find_catalog_id(OBJECTS_CATALOG_NAME)
+    if not catalog_id:
+        print(f"  Справочник «{OBJECTS_CATALOG_NAME}» не найден — новые объекты не добавлены")
+        return
+
+    catalog = client.get(f"catalogs/{catalog_id}")
+    existing_names = {item["values"][0] for item in catalog.get("items", []) if item.get("values")}
+
+    to_add = [name for name in object_names if name and name not in existing_names]
+    if not to_add:
+        return
+
+    client.post(
+        f"catalogs/{catalog_id}/diff",
+        {"upsert": [{"values": [name, ""]} for name in to_add]},
+    )
+    print(f"  Добавлены новые объекты в «{OBJECTS_CATALOG_NAME}»: {to_add}")
+
+
 def load_existing_rows(client, catalog_id):
     """Читает текущее содержимое справочника «Смета» и возвращает словарь
     {ключ: словарь_с_колонками_по_именам} — удобно для сверки при
@@ -142,6 +172,10 @@ def import_file(path, dry_run=False):
     print(f"  объекты в файле: {objects}")
 
     client = PyrusClient()
+
+    if not dry_run:
+        ensure_objects_registered(client, objects)
+
     catalog_id = client.find_or_create_catalog(CATALOG_NAME, CATALOG_HEADERS)
     print(f"Справочник «{CATALOG_NAME}»: catalog_id={catalog_id}")
 

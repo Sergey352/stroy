@@ -49,10 +49,22 @@
     python3 smeta_remainder_bot.py             # пересчитать всё
     python3 smeta_remainder_bot.py --dry-run   # только показать, что изменится
 
-TODO (см. CLAUDE.md): эту же логику нужно продублировать в src/index.js
-(вебхук на Cloudflare Workers) для мгновенного пересчёта при создании
-заявки — пока это не сделано, актуальный остаток появится не мгновенно,
-а при следующем прогоне этого скрипта по расписанию (GitHub Actions).
+ВТОРАЯ ЗАДАЧА ЭТОГО БОТА — «позиции нет в справочнике» (см. функцию
+check_missing_items ниже): т.к. catalog-поле в Pyrus не поддерживает
+свободный ввод (только строгий выбор из существующих элементов, проверено
+по официальной документации в сессии 2026-08-18), у таблицы «Позиции
+заявки» должна быть ЕЩЁ ОДНА колонка — текстовая, код `item_missing_description`
+(«Если позиции нет в списке — опишите здесь») — пользователь заполняет её
+вместо (не вместе с) «Номенклатура», когда не нашёл нужный материал в
+справочнике. Бот такие строки не может посчитать (не знает item_id) —
+вместо этого оставляет заявителю/снабженцу комментарий-напоминание.
+
+Запуск (тот же скрипт, оба действия — пересчёт остатка и проверка
+недостающих позиций — выполняются вместе за один проход по задачам):
+    export PYRUS_LOGIN="pyrus_demo@outlook.com"
+    export PYRUS_SECURITY_KEY="ваш_секретный_ключ"
+    python3 smeta_remainder_bot.py             # пересчитать всё
+    python3 smeta_remainder_bot.py --dry-run   # только показать, что изменится
 """
 
 import sys
@@ -68,6 +80,12 @@ COL_KEY = 0
 COL_NAME = 1
 COL_BUDGET_QTY = 6
 COL_REMAINDER = 7
+
+# Маркер в тексте комментария — чтобы не напоминать про одну и ту же
+# недостающую позицию на каждом прогоне бота (та же идея, что и в
+# overdue_reminder_bot.py: ищем этот маркер среди уже оставленных
+# комментариев задачи, прежде чем оставлять новый).
+MISSING_ITEM_MARKER = "⚠️ Позиция не из справочника «Смета»"
 
 
 def is_rejected(task):
@@ -114,6 +132,66 @@ def get_ordered_quantities(task):
     return result
 
 
+def get_missing_descriptions(task):
+    """Возвращает список текстов из колонки item_missing_description —
+    по одной строке таблицы на каждую позицию, которую не нашли в
+    справочнике «Смета». Строка считается «недостающей», только если
+    Номенклатура ПУСТА (а не просто одновременно с описанием — если
+    Номенклатура выбрана, текст в этой колонке уже не актуален, даже
+    если пользователь забыл его стереть)."""
+    descriptions = []
+    table_field = field_by_code(task.get("fields", []), "items_table")
+    if not table_field:
+        return descriptions
+
+    for row in table_field.get("value") or []:
+        cells = row.get("cells", [])
+        catalog_cell = field_by_code(cells, "item_catalog")
+        missing_cell = field_by_code(cells, "item_missing_description")
+        if not missing_cell:
+            continue  # колонка ещё не добавлена в форму — тихо пропускаем
+
+        has_catalog_value = bool((catalog_cell.get("value") or {}).get("item_id")) if catalog_cell else False
+        missing_text = (missing_cell.get("value") or "").strip()
+        if not has_catalog_value and missing_text:
+            descriptions.append(missing_text)
+
+    return descriptions
+
+
+def already_notified_about_missing(task):
+    """Проверяет, оставлял ли бот уже комментарий-напоминание об этой же
+    задаче (см. MISSING_ITEM_MARKER) — чтобы не дублировать при каждом
+    прогоне. Не различает, какие именно позиции уже упоминались: если
+    список недостающих позиций в заявке поменялся, снабженец всё равно
+    увидит актуальный список в предыдущем комментарии бота глазами — это
+    сознательное упрощение, не отслеживаем это тонко."""
+    for comment in task.get("comments", []):
+        if MISSING_ITEM_MARKER in (comment.get("text") or ""):
+            return True
+    return False
+
+
+def notify_missing_items(client, task):
+    """Если в заявке есть строки с описанием отсутствующей позиции —
+    оставляет один комментарий со списком, чтобы снабженец добавил их в
+    справочник «Смета» (вручную в Pyrus или через smeta_catalog_import.py)."""
+    descriptions = get_missing_descriptions(task)
+    if not descriptions or already_notified_about_missing(task):
+        return False
+
+    lines = "\n".join(f"- {d}" for d in descriptions)
+    text = (
+        f"{MISSING_ITEM_MARKER}\n"
+        f"В заявке есть позиции, которых нет в справочнике «Смета»:\n{lines}\n\n"
+        f"Снабженцу нужно добавить их в справочник (вручную в Pyrus или через "
+        f"smeta_catalog_import.py), после чего заявитель сможет выбрать позицию "
+        f"в поле «Номенклатура» этой строки."
+    )
+    client.post(f"tasks/{task['id']}/comments", {"text": text})
+    return True
+
+
 def sweep(dry_run=False):
     client = PyrusClient()
 
@@ -140,6 +218,7 @@ def sweep(dry_run=False):
     demand = {}  # {item_id: суммарное заказанное количество}
     considered_tasks = 0
     rejected_tasks = 0
+    missing_notified = 0
     for stub in register.get("tasks", []):
         task = client.get(f"tasks/{stub['id']}")["task"]
         if is_rejected(task):
@@ -148,6 +227,9 @@ def sweep(dry_run=False):
         considered_tasks += 1
         for item_id, qty in get_ordered_quantities(task).items():
             demand[item_id] = demand.get(item_id, 0.0) + qty
+
+        if not dry_run and notify_missing_items(client, task):
+            missing_notified += 1
 
     # Считаем новый остаток для каждой строки справочника и собираем те,
     # что реально изменились, в один запрос diff (не отправляем то, что
@@ -183,6 +265,8 @@ def sweep(dry_run=False):
         print(f"Обновлено строк: {len(result.get('updated', []))}")
     else:
         print("Изменений нет.")
+
+    print(f"Оставлено новых напоминаний о недостающих позициях: {missing_notified}")
 
 
 def main():
