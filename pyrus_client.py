@@ -92,6 +92,27 @@ class PyrusClient:
                 return c["catalog_id"]
         return None
 
+    def create_catalog(self, name, catalog_headers, items=None):
+        """Создаёт новый справочник (PUT /catalogs). items — необязательный
+        список начальных строк вида [{"values": [...]}]; можно передать
+        пустой список и наполнить справочник отдельно через diff."""
+        return self.put(
+            "catalogs",
+            {"name": name, "catalog_headers": catalog_headers, "items": items or []},
+        )
+
+    def find_or_create_catalog(self, name, catalog_headers):
+        """Находит справочник по имени, а если его ещё нет — создаёт с
+        заданными колонками. Возвращает catalog_id. Используется скриптами
+        импорта, которые должны быть безопасны для повторного запуска —
+        при первом запуске создают справочник сами, при последующих просто
+        находят уже существующий."""
+        catalog_id = self.find_catalog_id(name)
+        if catalog_id:
+            return catalog_id
+        result = self.create_catalog(name, catalog_headers)
+        return result["catalog_id"]
+
     def get_members(self):
         return self.get("members")["members"]
 

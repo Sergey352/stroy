@@ -1,0 +1,54 @@
+# Три сервиса (сессия 2026-08-18, переезд с Cloudflare на свой VDS):
+#
+#   cron    — по расписанию прогоняет ботов (smeta_remainder_bot.py и
+#             остальные). Не слушает никакие порты, доступ извне не нужен —
+#             можно запускать уже сейчас, без домена.
+#   webhook — мгновенный пересчёт по вебхуку от Pyrus. Нужен домен,
+#             указывающий на этот сервер (для HTTPS через Caddy) — пока
+#             домена нет, этот сервис просто не запускаем
+#             (`docker compose up -d cron`, без webhook/caddy).
+#   caddy   — обратный прокси перед webhook, сам получает и продлевает
+#             TLS-сертификат Let's Encrypt по домену из переменной DOMAIN
+#             (никаких дополнительных настроек не требует — в этом весь
+#             смысл Caddy по сравнению с nginx+certbot).
+#
+# Секреты (PYRUS_LOGIN и т.д.) — в файле .env рядом с этим файлом (см.
+# .env.example), сам .env в .gitignore, наружу не уходит.
+
+services:
+  cron:
+    build: .
+    container_name: pyrus_cron
+    restart: unless-stopped
+    command: ["./cron_loop.sh"]
+    env_file: .env
+    environment:
+      - CRON_INTERVAL_SECONDS=${CRON_INTERVAL_SECONDS:-900}
+
+  webhook:
+    build: .
+    container_name: pyrus_webhook
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000" # наружу порт не публикуем — только внутри docker-сети, наружу пускает caddy
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: pyrus_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"   # нужен для автоматического выпуска/продления сертификата Let's Encrypt
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # тут Caddy хранит выпущенные сертификаты — не терять при пересборке
+      - caddy_config:/config
+    depends_on:
+      - webhook
+
+volumes:
+  caddy_data:
+  caddy_config:

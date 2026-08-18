@@ -1,8 +1,11 @@
 name: Pyrus bots
 
+# Автозапуск по расписанию отключён (сессия 2026-08-18) — боты переехали
+# на собственный VDS пользователя (docker-compose, сервис "cron", см.
+# CLAUDE.md), он теперь единственный источник регулярного запуска.
+# workflow_dispatch оставлен — можно запустить вручную из вкладки Actions,
+# если понадобится (например, для отладки).
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -20,8 +23,8 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Остаток по смете (все активные заявки)
-        run: python budget_remainder_bot.py
+      - name: Остаток по позициям сметы (все активные заявки)
+        run: python smeta_remainder_bot.py
 
       - name: Напоминания о просрочке поставки
         run: python overdue_reminder_bot.py
