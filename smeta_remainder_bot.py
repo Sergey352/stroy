@@ -205,6 +205,45 @@ def notify_missing_items(client, task):
     return True
 
 
+OVERRUN_FIELD_CODE = "has_overrun"
+
+
+def sync_overrun_flag(client, task, task_items, remainder_by_item_id, dry_run=False):
+    """Ставит/снимает флажок «Есть перерасход по смете» (code=has_overrun)
+    на самой заявке — по нему в конструкторе настроено условие на шаге 2
+    маршрута «Требуется согласование» (сессия 2026-08-21: раньше этот шаг
+    срабатывал для КАЖДОЙ заявки безусловно — в конструкторе не было ни
+    одного реального условия ни на одном этапе, хотя название шага
+    подразумевало «только при перерасходе»; исправляем это здесь).
+
+    Перерасход = хотя бы одна позиция ИЗ ЭТОЙ ЗАЯВКИ (по справочнику
+    «Смета») имеет отрицательный остаток ПОСЛЕ учёта всех активных
+    заявок (не только этой) — то есть используем уже посчитанный
+    remainder_by_item_id из основного прохода sweep(), а не считаем
+    перерасход по этой заявке в изоляции (иначе две заявки, каждая в
+    пределах остатка по отдельности, но вместе превышающие его, не
+    поймались бы обе — только та, что обработана последней).
+
+    Возвращает True, если флажок реально пришлось поменять."""
+    overrun = any(remainder_by_item_id.get(item_id, 0) < 0 for item_id in task_items)
+
+    field = field_by_code(task.get("fields", []), OVERRUN_FIELD_CODE)
+    if not field:
+        return False  # поле ещё не добавлено на форму — тихо пропускаем
+
+    current_value = field.get("value")  # "checked" / "unchecked" / None
+    new_value = "checked" if overrun else "unchecked"
+    if current_value == new_value:
+        return False  # уже верно — не трогаем
+
+    if not dry_run:
+        client.post(
+            f"tasks/{task['id']}/comments",
+            {"field_updates": [{"code": OVERRUN_FIELD_CODE, "value": new_value}]},
+        )
+    return True
+
+
 def sweep(dry_run=False):
     client = PyrusClient()
 
@@ -232,13 +271,16 @@ def sweep(dry_run=False):
     considered_tasks = 0
     rejected_tasks = 0
     missing_notified = 0
+    active_tasks = []  # [(task, {item_id: qty этой самой задачи}), ...] — нужно на втором проходе для флажка «Есть перерасход»
     for stub in register.get("tasks", []):
         task = client.get(f"tasks/{stub['id']}")["task"]
         if is_rejected(task):
             rejected_tasks += 1
             continue
         considered_tasks += 1
-        for item_id, qty in get_ordered_quantities(task).items():
+        task_items = get_ordered_quantities(task)
+        active_tasks.append((task, task_items))
+        for item_id, qty in task_items.items():
             demand[item_id] = demand.get(item_id, 0.0) + qty
 
         if not dry_run and notify_missing_items(client, task):
@@ -248,6 +290,7 @@ def sweep(dry_run=False):
     # что реально изменились, в один запрос diff (не отправляем то, что
     # не поменялось — не создаём лишней активности).
     upsert_rows = []
+    remainder_by_item_id = {}  # {item_id: новый остаток} — для ВСЕХ позиций, не только изменившихся; нужно ниже для флажка «Есть перерасход»
     for item_id, values in rows_by_item_id.items():
         try:
             budget = float(values[COL_BUDGET_QTY])
@@ -256,6 +299,7 @@ def sweep(dry_run=False):
             continue
 
         new_remainder = budget - demand.get(item_id, 0.0)
+        remainder_by_item_id[item_id] = new_remainder
         remainder_changed = abs(new_remainder - current_remainder) >= 0.01
 
         # «Сумма остатка» = Остаток × Цена. Проверяем НЕЗАВИСИМО от того,
@@ -292,6 +336,15 @@ def sweep(dry_run=False):
 
     print(f"Заявок учтено: {considered_tasks}, отклонённых (пропущены): {rejected_tasks}")
     print(f"Строк справочника «Смета» к обновлению: {len(upsert_rows)} из {len(rows_by_item_id)}")
+
+    # Флажок «Есть перерасход по смете» — независимо от dry_run (сам
+    # sync_overrun_flag ничего не пишет в Pyrus, если dry_run=True, но
+    # посчитать и показать, что изменилось бы, полезно уже сейчас).
+    overrun_changed = 0
+    for task, task_items in active_tasks:
+        if task_items and sync_overrun_flag(client, task, task_items, remainder_by_item_id, dry_run=dry_run):
+            overrun_changed += 1
+    print(f"Обновлён флажок «Есть перерасход» у задач: {overrun_changed}")
 
     if dry_run:
         for row in upsert_rows[:20]:
