@@ -66,6 +66,23 @@ class PyrusClient:
         resp.raise_for_status()
         return resp.json()
 
+    def upload_file(self, file_bytes, filename):
+        """Загружает файл через POST /files/upload (единственный метод API,
+        который принимает multipart/form-data, а не JSON — поэтому не
+        через self.post(), у него другой Content-Type). Возвращает guid,
+        который потом передаётся в POST /tasks/{id}/comments в поле
+        attachments — так к задаче прикрепляется файл, сгенерированный
+        ботом (используется supplier_documents_bot.py для документов на
+        поставщиков)."""
+        resp = requests.post(
+            f"{self.api_url}files/upload",
+            headers={"Authorization": f"Bearer {self.token}"},  # Content-Type не указываем — requests сам поставит multipart с нужной границей
+            files={"file": (filename, file_bytes)},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ---- Вспомогательные методы ----
 
     def get_form(self, form_id=FORM_ID):

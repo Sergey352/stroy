@@ -21,6 +21,7 @@ while true; do
   python3 smeta_remainder_bot.py
   python3 overdue_reminder_bot.py
   python3 upd_reconciliation_bot.py
+  python3 supplier_documents_bot.py
   echo "=== готово, следующий запуск через ${INTERVAL} сек. ==="
   sleep "$INTERVAL"
 done
