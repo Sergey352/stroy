@@ -78,7 +78,13 @@ CATALOG_HEADERS = [
     "Кол-во по смете",
     "Остаток",
     "Цена",
+    "Сумма по смете",   # Кол-во по смете × Цена — не меняется после первого импорта (кроме повторной загрузки сметы с новой ценой/количеством)
+    "Сумма остатка",    # Остаток × Цена — пересчитывается каждый раз, когда меняется Остаток (см. smeta_remainder_bot.py)
 ]
+# У справочников Pyrus (в отличие от табличных полей формы) нет
+# встроенных формул-колонок — «Сумма» тут не считается сама, оба столбца
+# выше просто числа, которые вычисляет и записывает наш код (здесь и в
+# smeta_remainder_bot.py), а не Pyrus.
 MAX_ROW_CHARS = 500  # см. пояснение в докстринге модуля
 
 
@@ -103,10 +109,29 @@ def build_row_values(key, pos, remaining):
     unit = pos["unit"] or ""
     qty = f"{pos['qty']:g}"
     remaining_str = f"{remaining:g}"
-    price = f"{pos['price']:g}" if pos["price"] is not None else ""
+    price_value = pos["price"]
+    # .2f, не :g — иначе у дорогих позиций (шесть и больше значащих
+    # цифр, например 836102.61 руб.) сама «Цена» уже теряла копейки при
+    # сохранении, и любой пересчёт суммы от неё (здесь и в
+    # smeta_remainder_bot.py) наследовал эту неточность — обнаружено
+    # эмпирически в сессии 2026-08-21 вместе с похожим багом в суммах.
+    price = f"{price_value:.2f}" if price_value is not None else ""
+
+    # Сумма по смете/по остатку — только если известна цена, иначе пусто
+    # (не 0 — ноль выглядел бы как «цена ноль», а тут «цена неизвестна»).
+    # ВАЖНО: именно .2f, не :g — :g ограничивает ОБЩЕЕ число значащих
+    # цифр (по умолчанию 6), а не цифр после запятой, поэтому на суммах
+    # свыше ~десятков тысяч с копейками (например 42030.34) он тихо терял
+    # точность (получалось 42030.3/42030.4 вместо точных копеек) —
+    # обнаружено эмпирически в сессии 2026-08-21.
+    sum_budget = f"{pos['qty'] * price_value:.2f}" if price_value is not None else ""
+    sum_remaining = f"{remaining * price_value:.2f}" if price_value is not None else ""
 
     def total_len(nm):
-        return len(key) + len(nm) + len(cat1) + len(cat2) + len(obj) + len(unit) + len(qty) + len(remaining_str) + len(price)
+        return (
+            len(key) + len(nm) + len(cat1) + len(cat2) + len(obj) + len(unit)
+            + len(qty) + len(remaining_str) + len(price) + len(sum_budget) + len(sum_remaining)
+        )
 
     truncated = False
     if total_len(name) > MAX_ROW_CHARS:
@@ -114,7 +139,7 @@ def build_row_values(key, pos, remaining):
         overflow = total_len(name) - MAX_ROW_CHARS + 1  # +1 запас на символ "…"
         name = name[: max(0, len(name) - overflow)].rstrip() + "…"
 
-    values = [key, name, cat1, cat2, obj, unit, qty, remaining_str, price]
+    values = [key, name, cat1, cat2, obj, unit, qty, remaining_str, price, sum_budget, sum_remaining]
     return values, truncated
 
 

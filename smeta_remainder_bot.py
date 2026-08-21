@@ -82,6 +82,8 @@ COL_KEY = 0
 COL_NAME = 1
 COL_BUDGET_QTY = 6
 COL_REMAINDER = 7
+COL_PRICE = 8
+COL_SUM_REMAINDER = 10  # Остаток × Цена — пересчитывается вместе с Остатком, см. sweep()
 
 # Маркер в тексте комментария — чтобы не напоминать про одну и ту же
 # недостающую позицию на каждом прогоне бота (та же идея, что и в
@@ -254,11 +256,38 @@ def sweep(dry_run=False):
             continue
 
         new_remainder = budget - demand.get(item_id, 0.0)
-        if abs(new_remainder - current_remainder) < 0.01:
-            continue  # не изменилось — строку не трогаем
+        remainder_changed = abs(new_remainder - current_remainder) >= 0.01
+
+        # «Сумма остатка» = Остаток × Цена. Проверяем НЕЗАВИСИМО от того,
+        # поменялся ли сам остаток — иначе если «Остаток» уже случайно
+        # совпал с посчитанным (например, его обновил другой прогон бота
+        # раньше, чем «Сумма остатка»), рассинхрон между этими двумя
+        # числами остался бы незамеченным навсегда (проверено на реальном
+        # случае в сессии 2026-08-21 — после деплоя новой версии кода
+        # «Остаток» был уже верным, а «Сумма остатка» — ещё старой).
+        # .2f, не :g — см. пояснение в smeta_catalog_import.py про потерю
+        # точности на суммах с копейками при большом числе значащих цифр.
+        sum_changed = False
+        new_sum_str = None
+        try:
+            price = float(values[COL_PRICE])
+            expected_sum = new_remainder * price
+            current_sum = float(values[COL_SUM_REMAINDER]) if values[COL_SUM_REMAINDER] else None
+            if current_sum is None or abs(expected_sum - current_sum) >= 0.01:
+                sum_changed = True
+                new_sum_str = f"{expected_sum:.2f}"
+        except (ValueError, IndexError):
+            pass  # нет цены или колонки — сумму не считаем и не трогаем
+
+        if not remainder_changed and not sum_changed:
+            continue  # оба числа уже верны — строку не трогаем
 
         new_values = list(values)
-        new_values[COL_REMAINDER] = f"{new_remainder:g}"
+        if remainder_changed:
+            new_values[COL_REMAINDER] = f"{new_remainder:g}"
+        if sum_changed:
+            new_values[COL_SUM_REMAINDER] = new_sum_str
+
         upsert_rows.append({"values": new_values})
 
     print(f"Заявок учтено: {considered_tasks}, отклонённых (пропущены): {rejected_tasks}")
