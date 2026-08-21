@@ -132,21 +132,37 @@ def ensure_objects_registered(client, object_names):
 
     Возвращает список реально добавленных названий (пустой, если добавлять
     было нечего) — вызывающий код сам решает, печатать это в консоль или
-    показать на веб-странице."""
+    показать на веб-странице.
+
+    ВАЖНО: у справочника сейчас 4 колонки — [Объект, Адрес, Прораб,
+    Кладовщик] (последние две — тип «Участник», сессия 2026-08-19,
+    используются в маршруте формы для динамического назначения
+    ответственных по объекту, см. CLAUDE.md). Число колонок читаем из
+    самого справочника (`catalog_headers`), а не хардкодим — так функция
+    не сломается молча, если колонок станет больше/меньше. Прораб и
+    кладовщик для нового объекта остаются НЕ назначены (пустые ячейки) —
+    в файле сметы этих данных нет, снабженцу нужно проставить вручную в
+    самом справочнике после автодобавления."""
     catalog_id = client.find_catalog_id(OBJECTS_CATALOG_NAME)
     if not catalog_id:
         return []
 
     catalog = client.get(f"catalogs/{catalog_id}")
     existing_names = {item["values"][0] for item in catalog.get("items", []) if item.get("values")}
+    column_count = len(catalog.get("catalog_headers", [])) or 2
 
     to_add = [name for name in object_names if name and name not in existing_names]
     if not to_add:
         return []
 
+    def blank_row(object_name):
+        row = [""] * column_count
+        row[0] = object_name
+        return row
+
     client.post(
         f"catalogs/{catalog_id}/diff",
-        {"upsert": [{"values": [name, ""]} for name in to_add]},
+        {"upsert": [{"values": blank_row(name)} for name in to_add]},
     )
     return to_add
 
