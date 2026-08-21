@@ -19,10 +19,16 @@
 перерасхода) — нумерация шагов фиксированная, current_step просто
 перепрыгивает через шаг 2, если он не нужен.
 
-ПОСТАВЩИК НА ПОЗИЦИЮ: колонка «Поставщик» в таблице «Позиции заявки»,
-code=item_supplier, тип «Справочник» → «Поставщики» (306329). Проставляет
-снабженец вручную (решение сессии 2026-08-19 — автоподстановки пока нет,
-т.к. нет данных «какой материал у какого поставщика»).
+ПОСТАВЩИК НА ПОЗИЦИЮ: колонка «Поставщик», тип «Справочник» →
+«Поставщики» (306329), проставляет снабженец вручную (решение сессии
+2026-08-19 — автоподстановки пока нет, т.к. нет данных «какой материал у
+какого поставщика»). Такая колонка нужна В ОБЕИХ таблицах заявки:
+  - «Позиции заявки» — code=item_supplier
+  - «Позиции, отсутствующие в смете» — code=not_item_supplier
+Вторая таблица тоже участвует специально: то, что снабженец ещё не успел
+добавить в справочник «Смета», всё равно нужно закупить в рамках ЭТОЙ
+заявки — иначе такие позиции никогда не попали бы ни в один документ
+поставщику.
 
 ИДЕМПОТЕНТНОСТЬ: на каждого поставщика бот оставляет отдельный
 комментарий с прикреплённым файлом и с маркером в тексте (SUPPLIER_DOC_MARKER
@@ -49,22 +55,23 @@ SUPPLIER_DOC_MARKER = "📦 Документ поставщику"
 MIN_STEP_AFTER_SNABZHENIE = 4  # current_step >= 4 значит шаг 3 «Снабжение» пройден
 
 
-def get_rows_by_supplier(task):
-    """Группирует строки таблицы «Позиции заявки» по поставщику (колонка
-    item_supplier). Возвращает {имя_поставщика: [строка, строка, ...]},
-    где строка — словарь {name, unit, qty, price}. Строки без
-    проставленного поставщика или без выбранной номенклатуры пропускаются
-    (нечего включать в документ)."""
-    groups = {}
-    table_field = field_by_code(task.get("fields", []), "items_table")
+def _collect_rows_into_groups(task, groups, table_code, name_code, unit_code, qty_code, price_code, supplier_code):
+    """Общая логика сбора строк одной таблицы в {поставщик: [строки]} —
+    используется дважды: для «Позиции заявки» (обычные позиции по
+    справочнику «Смета») и для «Позиции, отсутствующие в смете» (снабженец
+    их ещё не добавил в справочник, но закупать всё равно нужно — иначе
+    эти материалы вообще никогда не попали бы ни в один документ
+    поставщику). Названия колонок в двух таблицах разные
+    (item_name/not_item_name и т.д.), поэтому код параметризован."""
+    table_field = field_by_code(task.get("fields", []), table_code)
     if not table_field:
-        return groups
+        return
 
     for row in table_field.get("value") or []:
         cells = row.get("cells", [])
-        supplier_cell = field_by_code(cells, "item_supplier")
+        supplier_cell = field_by_code(cells, supplier_code)
         if not supplier_cell:
-            continue  # колонка ещё не добавлена в форму — тихо пропускаем, как и в get_missing_descriptions
+            continue  # колонка ещё не добавлена в форму — тихо пропускаем
 
         supplier_value = supplier_cell.get("value") or {}
         supplier_names = supplier_value.get("values") or []
@@ -72,10 +79,10 @@ def get_rows_by_supplier(task):
         if not supplier_name:
             continue  # поставщик в этой строке не выбран
 
-        name = (field_by_code(cells, "item_name") or {}).get("value")
-        unit = (field_by_code(cells, "item_unit") or {}).get("value")
-        qty = (field_by_code(cells, "item_qty_ordered") or {}).get("value")
-        price = (field_by_code(cells, "item_price") or {}).get("value")
+        name = (field_by_code(cells, name_code) or {}).get("value")
+        unit = (field_by_code(cells, unit_code) or {}).get("value")
+        qty = (field_by_code(cells, qty_code) or {}).get("value")
+        price = (field_by_code(cells, price_code) or {}).get("value")
         if not name:
             continue
 
@@ -83,6 +90,25 @@ def get_rows_by_supplier(task):
             {"name": name, "unit": unit, "qty": qty, "price": price}
         )
 
+
+def get_rows_by_supplier(task):
+    """Группирует по поставщику строки ОБЕИХ таблиц заявки: «Позиции
+    заявки» (item_supplier) и «Позиции, отсутствующие в смете»
+    (not_item_supplier) — снабженец должен закупить материал независимо
+    от того, успел ли он уже добавить его в справочник «Смета». Возвращает
+    {имя_поставщика: [строка, строка, ...]}, строка — словарь
+    {name, unit, qty, price}."""
+    groups = {}
+    _collect_rows_into_groups(
+        task, groups,
+        table_code="items_table", name_code="item_name", unit_code="item_unit",
+        qty_code="item_qty_ordered", price_code="item_price", supplier_code="item_supplier",
+    )
+    _collect_rows_into_groups(
+        task, groups,
+        table_code="missing_items_table", name_code="not_item_name", unit_code="not_item_unit",
+        qty_code="not_item_qty_ordered", price_code="not_item_price", supplier_code="not_item_supplier",
+    )
     return groups
 
 
