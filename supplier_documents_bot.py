@@ -50,39 +50,94 @@ import sys
 from openpyxl import Workbook
 
 from pyrus_client import PyrusClient, FORM_ID, field_by_code
+from smeta_remainder_bot import is_rejected  # переиспользуем ту же проверку отклонения, не дублируем
 
 SUPPLIER_DOC_MARKER = "📦 Документ поставщику"
 MIN_STEP_AFTER_SNABZHENIE = 4  # current_step >= 4 значит шаг 3 «Снабжение» пройден
 
 
-def _collect_rows_into_groups(task, groups, table_code, name_code, unit_code, qty_code, price_code, supplier_code):
-    """Общая логика сбора строк одной таблицы в {поставщик: [строки]} —
-    используется дважды: для «Позиции заявки» (обычные позиции по
-    справочнику «Смета») и для «Позиции, отсутствующие в смете» (снабженец
-    их ещё не добавил в справочник, но закупать всё равно нужно — иначе
-    эти материалы вообще никогда не попали бы ни в один документ
-    поставщику). Названия колонок в двух таблицах разные
-    (item_name/not_item_name и т.д.), поэтому код параметризован."""
-    table_field = field_by_code(task.get("fields", []), table_code)
+def _get_supplier_name(cells, supplier_code):
+    """Достаёт название поставщика из catalog-ячейки (первое значение
+    первой колонки справочника «Поставщики» — «Название»). Общая часть
+    для обеих таблиц, у обеих колонка поставщика — обычный catalog-тип."""
+    supplier_cell = field_by_code(cells, supplier_code)
+    if not supplier_cell:
+        return None  # колонка ещё не добавлена в форму — тихо пропускаем
+    supplier_value = supplier_cell.get("value") or {}
+    supplier_names = supplier_value.get("values") or []
+    return supplier_names[0] if supplier_names else None
+
+
+def _collect_items_table_rows(task, groups):
+    """«Позиции заявки» — обычные позиции по справочнику «Смета».
+
+    Название/ед.изм./цена ПРЕДПОЧТИТЕЛЬНО берутся из уже автоподставленных
+    ячеек item_name/item_unit/item_price — их заполняет pyrus_form_script.js
+    прямо в браузере в момент выбора «Номенклатура» (см. этот файл). НО
+    если этих ячеек почему-то нет — например, задача создана напрямую
+    через API (как в наших тестах), а не через реальную форму в браузере,
+    и скрипт формы просто не успел сработать — код всё равно должен
+    работать: тогда те же данные читаются НАПРЯМУЮ из значения самого
+    catalog-поля item_catalog (там всегда есть headers/values выбранной
+    строки справочника «Смета», это не зависит от браузерного скрипта).
+    Это не просто подстраховка для тестов — это более надёжный источник
+    в принципе, поэтому проверяется в первую очередь для цены/названия,
+    если автоподстановленных ячеек нет.
+    (Обнаружено эмпирически в сессии 2026-08-21 при первой же проверке
+    функционала на реальной тестовой заявке.)"""
+    table_field = field_by_code(task.get("fields", []), "items_table")
     if not table_field:
         return
 
     for row in table_field.get("value") or []:
         cells = row.get("cells", [])
-        supplier_cell = field_by_code(cells, supplier_code)
-        if not supplier_cell:
-            continue  # колонка ещё не добавлена в форму — тихо пропускаем
-
-        supplier_value = supplier_cell.get("value") or {}
-        supplier_names = supplier_value.get("values") or []
-        supplier_name = supplier_names[0] if supplier_names else None
+        supplier_name = _get_supplier_name(cells, "item_supplier")
         if not supplier_name:
             continue  # поставщик в этой строке не выбран
 
-        name = (field_by_code(cells, name_code) or {}).get("value")
-        unit = (field_by_code(cells, unit_code) or {}).get("value")
-        qty = (field_by_code(cells, qty_code) or {}).get("value")
-        price = (field_by_code(cells, price_code) or {}).get("value")
+        catalog_cell = field_by_code(cells, "item_catalog")
+        catalog_value = (catalog_cell or {}).get("value") or {}
+        catalog_row = dict(zip(catalog_value.get("headers", []), catalog_value.get("values", [])))
+
+        name = (field_by_code(cells, "item_name") or {}).get("value") or catalog_row.get("Наименование")
+        unit = (field_by_code(cells, "item_unit") or {}).get("value") or catalog_row.get("Ед. изм.")
+        qty = (field_by_code(cells, "item_qty_ordered") or {}).get("value")
+
+        price = (field_by_code(cells, "item_price") or {}).get("value")
+        if price is None:
+            try:
+                price = float(catalog_row["Цена"]) if catalog_row.get("Цена") else None
+            except ValueError:
+                price = None
+
+        if not name:
+            continue
+
+        groups.setdefault(supplier_name, []).append(
+            {"name": name, "unit": unit, "qty": qty, "price": price}
+        )
+
+
+def _collect_missing_items_table_rows(task, groups):
+    """«Позиции, отсутствующие в смете» — снабженец их ещё не добавил в
+    справочник «Смета», но закупать всё равно нужно в рамках этой же
+    заявки, иначе такие материалы никогда не попали бы ни в один документ
+    поставщику. Тут все поля — обычный свободный ввод (не catalog-ссылка),
+    фолбэк из справочника не нужен, данные всегда там, где их вписали."""
+    table_field = field_by_code(task.get("fields", []), "missing_items_table")
+    if not table_field:
+        return
+
+    for row in table_field.get("value") or []:
+        cells = row.get("cells", [])
+        supplier_name = _get_supplier_name(cells, "not_item_supplier")
+        if not supplier_name:
+            continue
+
+        name = (field_by_code(cells, "not_item_name") or {}).get("value")
+        unit = (field_by_code(cells, "not_item_unit") or {}).get("value")
+        qty = (field_by_code(cells, "not_item_qty_ordered") or {}).get("value")
+        price = (field_by_code(cells, "not_item_price") or {}).get("value")
         if not name:
             continue
 
@@ -92,23 +147,12 @@ def _collect_rows_into_groups(task, groups, table_code, name_code, unit_code, qt
 
 
 def get_rows_by_supplier(task):
-    """Группирует по поставщику строки ОБЕИХ таблиц заявки: «Позиции
-    заявки» (item_supplier) и «Позиции, отсутствующие в смете»
-    (not_item_supplier) — снабженец должен закупить материал независимо
-    от того, успел ли он уже добавить его в справочник «Смета». Возвращает
+    """Группирует по поставщику строки ОБЕИХ таблиц заявки. Возвращает
     {имя_поставщика: [строка, строка, ...]}, строка — словарь
     {name, unit, qty, price}."""
     groups = {}
-    _collect_rows_into_groups(
-        task, groups,
-        table_code="items_table", name_code="item_name", unit_code="item_unit",
-        qty_code="item_qty_ordered", price_code="item_price", supplier_code="item_supplier",
-    )
-    _collect_rows_into_groups(
-        task, groups,
-        table_code="missing_items_table", name_code="not_item_name", unit_code="not_item_unit",
-        qty_code="not_item_qty_ordered", price_code="not_item_price", supplier_code="not_item_supplier",
-    )
+    _collect_items_table_rows(task, groups)
+    _collect_missing_items_table_rows(task, groups)
     return groups
 
 
@@ -201,6 +245,9 @@ def sweep(dry_run=False):
     total_generated = 0
     for stub in register.get("tasks", []):
         task = client.get(f"tasks/{stub['id']}")["task"]
+
+        if is_rejected(task):
+            continue  # отклонённую заявку не закупаем — документы поставщикам не нужны
 
         if task.get("current_step", 0) < MIN_STEP_AFTER_SNABZHENIE:
             continue  # шаг «Снабжение» ещё не пройден — рано генерировать документы
